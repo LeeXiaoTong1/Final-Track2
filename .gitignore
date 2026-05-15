@@ -1,0 +1,44 @@
+__pycache__/
+*.pyc
+*.so
+
+# dataset
+AT_ADD_data/
+data/
+dataset/
+datasets/
+
+# pretrained models
+huggingface/
+huggingface_cache/
+.cache/
+
+# checkpoints and results
+ckpt_t1/
+ckpt_t2/
+models/
+output/
+outputs/
+result/
+results/
+runs/
+wandb/
+logs/
+
+# large model files
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# logs and submissions
+*.log
+nohup.out
+predict.csv
+*_submit.zip
+*.zip
+
+# IDE
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,20 @@
+运行项目，别忘了剪切：数据集、huggingface、huggingface_cache
+
+python main_train.py \
+  --gpu 0 \
+  --train_task atadd-track2 \
+  --model ft-w2v2aasist \
+  --t2_return_type \
+  --t2_gdro \
+  --t2_gdro_eta 2.0 \
+  --t2_type_adv \
+  --t2_type_adv_weight 0.05 \
+  --t2_grl_lambda 1.0 \
+  --t2_type_feat_dim 160 \
+  --seed 1234 \
+  --batch_size 14 \
+  --lr 0.000001 \
+  --num_epochs 10 \
+  --interval 2 \
+  --save_best_by f1 \
+  --o ./ckpt_t2/gdro_adv_xlsr_aasist
