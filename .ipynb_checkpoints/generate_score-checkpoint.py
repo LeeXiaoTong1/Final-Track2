@@ -116,6 +116,22 @@ def build_model(args):
             num_wavelet_tokens=args.num_wavelet_tokens,
             dropout=args.pt_dropout
         ).to(args.device)
+        
+    if args.model == "ufm-track2-full":
+        feat_model = UFMTrack2Full(
+            xlsr_dir=args.xlsr,
+            mert_dir=args.mert,
+            beats_dir=args.beats,
+            device=args.device,
+            freeze_xlsr=args.ufm_freeze_xlsr,
+            freeze_mert=args.ufm_freeze_mert,
+            freeze_beats=args.ufm_freeze_beats,
+            dim=args.ufm_dim,
+            mem_slots=args.ufm_mem_slots,
+            heads=args.ufm_heads,
+            layers=args.ufm_layers,
+            dropout=args.ufm_dropout
+        ).to(args.device)
     ## 5.13
     if args.model == 'ft-mertaasist':
         feat_model = MERTAASIST(model_dir=args.mert, freeze=False).to(args.device)
@@ -170,7 +186,6 @@ if __name__ == "__main__":
     print("Model:", args.model)
     feat_model = build_model(args)
     # feat_model.load_state_dict(checkpoint)
-    ## 5.13
     missing, unexpected = feat_model.load_state_dict(checkpoint, strict=False)
     print("Missing keys:", missing)
     print("Unexpected keys:", unexpected)

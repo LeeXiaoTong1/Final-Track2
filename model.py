@@ -1187,12 +1187,828 @@ class TypeRoutedXLSRMERTAASIST(nn.Module):
         super().eval()
         return self
 ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
+
+
+# ============================================================
+# UFM-Track2-Full Modules
+# ============================================================
+
+class ComplexArtifactEncoder(nn.Module):
+    """
+    Complex forensic artifact branch.
+
+    Input:
+        wav: [B, L]
+
+    Build 4-channel STFT forensic representation:
+        1. log magnitude
+        2. temporal phase difference
+        3. frequency phase difference / group-delay-like cue
+        4. local spectral residual
+
+    Output:
+        artifact tokens: [B, T, D]
+    """
+    def __init__(
+        self,
+        out_dim=512,
+        n_fft=512,
+        hop_length=160,
+        win_length=400,
+        dropout=0.1
+    ):
+        super(ComplexArtifactEncoder, self).__init__()
+
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+
+            nn.Conv2d(32, 64, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(256),
+            nn.GELU(),
+
+            nn.Dropout(dropout)
+        )
+
+        self.proj = nn.Linear(256, out_dim)
+
+    def forward(self, wav):
+        if wav.dim() == 3:
+            wav = wav.squeeze(1)
+
+        window = torch.hann_window(
+            self.win_length,
+            device=wav.device,
+            dtype=wav.dtype
+        )
+
+        stft = torch.stft(
+            wav,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=window,
+            return_complex=True
+        )  # [B, F, T]
+
+        mag = torch.abs(stft).clamp(min=1e-6)
+        logmag = torch.log(mag)
+
+        phase = torch.angle(stft)
+
+        # Temporal phase difference
+        phase_dt = phase[:, :, 1:] - phase[:, :, :-1]
+        phase_dt = F.pad(phase_dt, (1, 0))
+
+        # Frequency phase difference, group-delay-like
+        phase_df = phase[:, 1:, :] - phase[:, :-1, :]
+        phase_df = F.pad(phase_df, (0, 0, 1, 0))
+
+        # Local spectral residual
+        smooth = F.avg_pool2d(
+            logmag.unsqueeze(1),
+            kernel_size=(5, 5),
+            stride=1,
+            padding=(2, 2)
+        ).squeeze(1)
+
+        residual = logmag - smooth
+
+        x = torch.stack(
+            [logmag, phase_dt, phase_df, residual],
+            dim=1
+        )  # [B, 4, F, T]
+
+        x = self.cnn(x)      # [B, 256, F', T]
+        x = x.mean(dim=2)    # [B, 256, T]
+        x = x.transpose(1, 2)  # [B, T, 256]
+        x = self.proj(x)     # [B, T, out_dim]
+
+        return x
+    
+class FullForgeryMemory(nn.Module):
+    """
+    Shared + type-conditioned forgery memory.
+
+    Memory banks:
+        real_shared: common real prototypes
+        fake_shared: common fake prototypes
+        fake_type: type-conditioned fake prototypes
+                   speech/sound/singing/music
+
+    Input:
+        tokens: [B, T, D]
+        type_prior: [B, 4]
+
+    Output:
+        enhanced tokens: [B, T, D]
+        memory gap: [B, 2D]
+    """
+    def __init__(
+        self,
+        dim=512,
+        slots=16,
+        n_types=4,
+        dropout=0.1
+    ):
+        super(FullForgeryMemory, self).__init__()
+
+        self.real_shared = nn.Parameter(torch.randn(slots, dim) * 0.02)
+        self.fake_shared = nn.Parameter(torch.randn(slots, dim) * 0.02)
+
+        self.fake_type = nn.Parameter(
+            torch.randn(n_types, slots, dim) * 0.02
+        )
+
+        self.norm = nn.LayerNorm(dim)
+
+        self.update = nn.Sequential(
+            nn.Linear(dim * 3, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim)
+        )
+        
+        self.res_scale = nn.Parameter(torch.tensor(0.0))
+
+        # Start memory update close to identity to avoid early instability.
+        nn.init.zeros_(self.update[-1].weight)
+        nn.init.zeros_(self.update[-1].bias)
+
+    def attend(self, tokens, memory):
+        """
+        tokens: [B, T, D]
+        memory:
+            [K, D] or [B, K, D]
+        """
+        scale = tokens.size(-1) ** -0.5
+
+        if memory.dim() == 2:
+            memory = memory.unsqueeze(0).expand(tokens.size(0), -1, -1)
+
+        attn = torch.softmax(
+            torch.matmul(tokens, memory.transpose(-1, -2)) * scale,
+            dim=-1
+        )
+
+        ctx = torch.matmul(attn, memory)
+        return ctx
+
+    def forward(self, tokens, type_prior=None):
+        z = self.norm(tokens)
+
+        B = z.size(0)
+        n_types = self.fake_type.size(0)
+
+        if type_prior is None:
+            type_prior = torch.ones(
+                B,
+                n_types,
+                device=z.device,
+                dtype=z.dtype
+            ) / n_types
+
+        real_ctx = self.attend(z, self.real_shared)
+        fake_shared_ctx = self.attend(z, self.fake_shared)
+
+        # Mixture of type-conditioned fake memories
+        type_mem = torch.einsum(
+            "bn,nkd->bkd",
+            type_prior,
+            self.fake_type
+        )
+
+        fake_type_ctx = self.attend(z, type_mem)
+
+        gap_shared = fake_shared_ctx - real_ctx
+        gap_type = fake_type_ctx - real_ctx
+
+        delta = self.update(
+            torch.cat([z, gap_shared, gap_type], dim=-1)
+        )
+
+        if not torch.isfinite(delta).all():
+            with torch.no_grad():
+                y = torch.nan_to_num(delta.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+                print(
+                    f"[NONFINITE MEMORY] delta | "
+                    f"shape={tuple(delta.shape)} | "
+                    f"nan={torch.isnan(delta).any().item()} | "
+                    f"inf={torch.isinf(delta).any().item()} | "
+                    f"min={y.min().item():.4e} | "
+                    f"max={y.max().item():.4e}"
+                )
+            raise RuntimeError("Non-finite memory delta")
+
+        delta = torch.clamp(delta, min=-10.0, max=10.0)
+
+        enhanced = tokens + torch.tanh(self.res_scale) * delta
+
+        pooled_gap = torch.cat(
+            [
+                gap_shared.mean(dim=1),
+                gap_type.mean(dim=1)
+            ],
+            dim=-1
+        )  # [B, 2D]
+
+        return enhanced, pooled_gap
+    
+class FullExpertRouter(nn.Module):
+    """
+    Uncertainty-aware expert router.
+
+    Experts:
+        0 XLSR
+        1 MERT
+        2 BEATs/OpenBEATs
+        3 Artifact/Memory stream
+    """
+    def __init__(
+        self,
+        dim=512,
+        n_experts=4,
+        n_types=4,
+        dropout=0.1
+    ):
+        super(FullExpertRouter, self).__init__()
+
+        in_dim = dim * 7
+
+        self.router = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, n_experts)
+        )
+
+        self.type_head = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, n_types)
+        )
+
+    def forward(
+        self,
+        x_pool,
+        m_pool,
+        b_pool,
+        a_pool,
+        f_pool,
+        mem_gap
+    ):
+        """
+        x_pool: [B, D]
+        m_pool: [B, D]
+        b_pool: [B, D]
+        a_pool: [B, D]
+        f_pool: [B, D]
+        mem_gap: [B, 2D]
+        """
+        h = torch.cat(
+            [x_pool, m_pool, b_pool, a_pool, f_pool, mem_gap],
+            dim=-1
+        )  # [B, 7D]
+
+        expert_logits = self.router(h)
+        type_logits = self.type_head(h)
+
+        expert_weights = torch.softmax(expert_logits, dim=-1)
+        type_prob = torch.softmax(type_logits, dim=-1)
+
+        return expert_weights, type_logits, type_prob
+    
+class CrossStreamFusionBlock(nn.Module):
+    """
+    Bidirectional semantic-forensic cross-attention.
+    """
+    def __init__(
+        self,
+        dim=512,
+        num_heads=8,
+        dropout=0.1
+    ):
+        super(CrossStreamFusionBlock, self).__init__()
+
+        self.sem_norm = nn.LayerNorm(dim)
+        self.for_norm = nn.LayerNorm(dim)
+        
+        self.attn_scale = nn.Parameter(torch.tensor(0.0))
+        self.ffn_scale = nn.Parameter(torch.tensor(0.0))
+
+        self.sem_to_for = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.for_to_sem = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.sem_ffn = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim)
+        )
+
+        self.for_ffn = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim)
+        )
+    
+    def _check_finite(self, name, x):
+        if not torch.isfinite(x).all():
+            with torch.no_grad():
+                y = torch.nan_to_num(x.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+                print(
+                    f"[NONFINITE CROSS] {name} | "
+                    f"shape={tuple(x.shape)} | "
+                    f"nan={torch.isnan(x).any().item()} | "
+                    f"inf={torch.isinf(x).any().item()} | "
+                    f"min={y.min().item():.4e} | "
+                    f"max={y.max().item():.4e}"
+                )
+            raise RuntimeError(f"Non-finite cross tensor: {name}")
+        return x
+
+    def forward(self, semantic_tokens, forensic_tokens):
+        sem = self.sem_norm(semantic_tokens)
+        forg = self.for_norm(forensic_tokens)
+
+        sem_ctx, _ = self.sem_to_for(
+            query=sem,
+            key=forg,
+            value=forg,
+            need_weights=False
+        )
+
+        for_ctx, _ = self.for_to_sem(
+            query=forg,
+            key=sem,
+            value=sem,
+            need_weights=False
+        )
+
+        sem_ctx = self._check_finite("sem_ctx", sem_ctx)
+        for_ctx = self._check_finite("for_ctx", for_ctx)
+
+        sem_ctx = torch.clamp(sem_ctx, -10.0, 10.0)
+        for_ctx = torch.clamp(for_ctx, -10.0, 10.0)
+
+        sem_ctx = torch.clamp(sem_ctx, min=-10.0, max=10.0)
+        for_ctx = torch.clamp(for_ctx, min=-10.0, max=10.0)
+
+        semantic_tokens = semantic_tokens + torch.tanh(self.attn_scale) * sem_ctx
+        forensic_tokens = forensic_tokens + torch.tanh(self.attn_scale) * for_ctx
+
+        sem_ffn = self.sem_ffn(semantic_tokens)
+        for_ffn = self.for_ffn(forensic_tokens)
+
+        sem_ffn = self._check_finite("sem_ffn", sem_ffn)
+        for_ffn = self._check_finite("for_ffn", for_ffn)
+
+        sem_ffn = torch.clamp(sem_ffn, -10.0, 10.0)
+        for_ffn = torch.clamp(for_ffn, -10.0, 10.0)
+
+        sem_ffn = torch.clamp(sem_ffn, min=-10.0, max=10.0)
+        for_ffn = torch.clamp(for_ffn, min=-10.0, max=10.0)
+
+        semantic_tokens = semantic_tokens + torch.tanh(self.ffn_scale) * sem_ffn
+        forensic_tokens = forensic_tokens + torch.tanh(self.ffn_scale) * for_ffn
+        
+        return semantic_tokens, forensic_tokens
+
+
+class BiCrossStreamTransformer(nn.Module):
+    def __init__(
+        self,
+        dim=512,
+        heads=8,
+        layers=2,
+        dropout=0.1
+    ):
+        super(BiCrossStreamTransformer, self).__init__()
+
+        self.layers = nn.ModuleList([
+            CrossStreamFusionBlock(
+                dim=dim,
+                num_heads=heads,
+                dropout=dropout
+            )
+            for _ in range(layers)
+        ])
+
+    def forward(self, sem, forg):
+        for layer in self.layers:
+            sem, forg = layer(sem, forg)
+
+        return sem, forg
+    
+class ForgeryQueryDecoder(nn.Module):
+    """
+    Learnable real/fake query decoder.
+    """
+    def __init__(
+        self,
+        dim=1024,
+        heads=8,
+        dropout=0.1
+    ):
+        super(ForgeryQueryDecoder, self).__init__()
+
+        self.queries = nn.Parameter(torch.randn(2, dim) * 0.02)
+
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.norm = nn.LayerNorm(dim)
+
+        self.cls = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, 2)
+        )
+
+    def forward(self, tokens):
+        B = tokens.size(0)
+
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)
+
+        q_out, _ = self.attn(
+            query=q,
+            key=tokens,
+            value=tokens,
+            need_weights=False
+        )
+
+        q_out = self.norm(q_out)
+
+        real_q = q_out[:, 0]
+        fake_q = q_out[:, 1]
+
+        logits = self.cls(
+            torch.cat([real_q, fake_q], dim=-1)
+        )
+
+        return logits
+    
+class UFMTrack2Full(nn.Module):
+    """
+    UFM-Track2-Full:
+        XLSR Expert
+        MERT Expert
+        BEATs/OpenBEATs Expert
+        Complex Artifact Encoder
+        Shared + Type-conditioned Forgery Memory
+        Uncertainty-aware Expert Router
+        Semantic-Forensic Cross-stream Transformer
+        Forgery Query Decoder
+    """
+    def __init__(
+        self,
+        xlsr_dir,
+        mert_dir,
+        beats_dir,
+        device="cuda",
+        freeze_xlsr=True,
+        freeze_mert=True,
+        freeze_beats=True,
+        dim=512,
+        mem_slots=16,
+        heads=8,
+        layers=2,
+        dropout=0.1
+    ):
+        super(UFMTrack2Full, self).__init__()
+
+        self.freeze_xlsr = freeze_xlsr
+        self.freeze_mert = freeze_mert
+        self.freeze_beats = freeze_beats
+
+        self.xlsr = XLSR(
+            model_dir=xlsr_dir,
+            device=device,
+            freeze=freeze_xlsr
+        )
+
+        self.mert = MERT(
+            model_dir=mert_dir,
+            device=device,
+            freeze=freeze_mert
+        )
+
+        self.beats = OpenBEATS(
+            model_dir=beats_dir,
+            device=device,
+            freeze=freeze_beats
+        )
+
+        xlsr_dim = getattr(self.xlsr.model.config, "hidden_size", 1024)
+        mert_dim = getattr(self.mert.model.config, "hidden_size", 1024)
+        self.proj_xlsr = nn.Linear(xlsr_dim, dim)
+        self.proj_mert = nn.Linear(mert_dim, dim)
+        self.proj_beats = nn.Linear(1024, dim)
+
+        self.norm_xlsr = nn.LayerNorm(dim)
+        self.norm_mert = nn.LayerNorm(dim)
+        self.norm_beats = nn.LayerNorm(dim)
+        self.norm_artifact = nn.LayerNorm(dim)
+        self.norm_memory = nn.LayerNorm(dim)
+        self.norm_fused = nn.LayerNorm(dim * 2)
+
+        self.artifact = ComplexArtifactEncoder(
+            out_dim=dim,
+            dropout=dropout
+        )
+
+        self.memory = FullForgeryMemory(
+            dim=dim,
+            slots=mem_slots,
+            n_types=4,
+            dropout=dropout
+        )
+
+        self.router = FullExpertRouter(
+            dim=dim,
+            n_experts=4,
+            n_types=4,
+            dropout=dropout
+        )
+
+        self.cross = BiCrossStreamTransformer(
+            dim=dim,
+            heads=heads,
+            layers=layers,
+            dropout=dropout
+        )
+
+        self.decoder = ForgeryQueryDecoder(
+            dim=dim * 2,
+            heads=heads,
+            dropout=dropout
+        )
+
+        self.latest_expert_weights = None
+        self.latest_type_logits = None
+    
+    def _safe(self, x, clamp=20.0):
+        x = torch.nan_to_num(
+            x,
+            nan=0.0,
+            posinf=clamp,
+            neginf=-clamp
+        )
+        x = torch.clamp(x, min=-clamp, max=clamp)
+        return x
+    
+    def _safe_frozen(self, x, clamp=20.0):
+        x = torch.nan_to_num(
+            x,
+            nan=0.0,
+            posinf=clamp,
+            neginf=-clamp
+        )
+        x = torch.clamp(x, min=-clamp, max=clamp)
+        return x
+
+
+    def _check_finite(self, name, x):
+        if not torch.isfinite(x).all():
+            with torch.no_grad():
+                y = torch.nan_to_num(x.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+                print(
+                    f"[NONFINITE FORWARD] {name} | "
+                    f"shape={tuple(x.shape)} | "
+                    f"nan={torch.isnan(x).any().item()} | "
+                    f"inf={torch.isinf(x).any().item()} | "
+                    f"min={y.min().item():.4e} | "
+                    f"max={y.max().item():.4e} | "
+                    f"mean={y.mean().item():.4e} | "
+                    f"std={y.std().item():.4e}"
+                )
+            raise RuntimeError(f"Non-finite forward tensor: {name}")
+        return x
+    
+    def _align_time(self, feat, target_len):
+        if feat.size(1) == target_len:
+            return feat
+
+        feat = feat.transpose(1, 2)
+
+        feat = F.interpolate(
+            feat,
+            size=target_len,
+            mode="linear",
+            align_corners=False
+        )
+
+        feat = feat.transpose(1, 2)
+
+        return feat
+
+    def forward(self, wav):
+        if wav.dim() == 3:
+            wav = wav.squeeze(1)
+
+        # =====================================================
+        # 1. Multi-domain experts
+        # =====================================================
+        xlsr_feat = self._safe_frozen(self.xlsr.extract_features(wav).float())
+        mert_feat = self._safe_frozen(self.mert.extract_features(wav).float())
+        beats_feat = self._safe_frozen(self.beats.extract_features(wav).float())
+
+        x = self.proj_xlsr(xlsr_feat)
+        m = self.proj_mert(mert_feat)
+        b = self.proj_beats(beats_feat)
+
+        x = self._check_finite("proj_xlsr", x)
+        m = self._check_finite("proj_mert", m)
+        b = self._check_finite("proj_beats", b)
+
+        x = self.norm_xlsr(torch.clamp(x, -20.0, 20.0))
+        m = self.norm_mert(torch.clamp(m, -20.0, 20.0))
+        b = self.norm_beats(torch.clamp(b, -20.0, 20.0))
+        T = x.size(1)
+
+        m = self._align_time(m, T)
+        b = self._align_time(b, T)
+
+        # =====================================================
+        # 2. Complex artifact branch
+        # =====================================================
+        a = self.artifact(wav)
+        a = self._align_time(a, T)
+        a = self._check_finite("artifact", a)
+        a = self.norm_artifact(torch.clamp(a, -20.0, 20.0))
+
+        # =====================================================
+        # 3. First-pass memory with uniform type prior
+        # =====================================================
+        B = wav.size(0)
+
+        uniform_type_prior = torch.ones(
+            B,
+            4,
+            device=wav.device,
+            dtype=x.dtype
+        ) / 4.0
+
+        a_mem, mem_gap = self.memory(
+            a,
+            type_prior=uniform_type_prior
+        )
+        a_mem = self._check_finite("a_mem_first", a_mem)
+        mem_gap = self._check_finite("mem_gap_first", mem_gap)
+
+        a_mem = self.norm_memory(torch.clamp(a_mem, -20.0, 20.0))
+        mem_gap = torch.clamp(mem_gap, -20.0, 20.0)
+        
+        # =====================================================
+        # 4. Router
+        # =====================================================
+        x_pool = x.mean(dim=1)
+        m_pool = m.mean(dim=1)
+        b_pool = b.mean(dim=1)
+        a_pool = a.mean(dim=1)
+        f_pool = a_mem.mean(dim=1)
+
+        expert_w, type_logits, type_prob = self.router(
+            x_pool,
+            m_pool,
+            b_pool,
+            a_pool,
+            f_pool,
+            mem_gap
+        )
+        expert_w = self._check_finite("expert_w", expert_w)
+        type_logits = self._check_finite("type_logits", type_logits)
+        type_prob = self._check_finite("type_prob", type_prob)
+
+        # =====================================================
+        # 5. Second-pass memory with predicted type prior
+        # =====================================================
+        a_mem, mem_gap = self.memory(
+            a,
+            type_prior=type_prob
+        )
+        a_mem = self._check_finite("a_mem_second", a_mem)
+        mem_gap = self._check_finite("mem_gap_second", mem_gap)
+
+        a_mem = self.norm_memory(torch.clamp(a_mem, -20.0, 20.0))
+        mem_gap = torch.clamp(mem_gap, -20.0, 20.0)
+        
+        self.latest_expert_weights = expert_w
+        self.latest_type_logits = type_logits
+
+        # =====================================================
+        # 6. Semantic expert fusion
+        # =====================================================
+        sem_w = expert_w[:, :3]
+        sem_w = sem_w / (sem_w.sum(dim=-1, keepdim=True) + 1e-8)
+
+        semantic = (
+            sem_w[:, 0].view(-1, 1, 1) * x +
+            sem_w[:, 1].view(-1, 1, 1) * m +
+            sem_w[:, 2].view(-1, 1, 1) * b
+        )
+
+        # =====================================================
+        # 7. Forensic fusion
+        # =====================================================
+        art_gate = expert_w[:, 3].view(-1, 1, 1)
+
+        forensic = (
+            art_gate * a_mem +
+            (1.0 - art_gate) * a
+        )
+
+        # =====================================================
+        # 8. Cross-stream interaction
+        # =====================================================
+        semantic, forensic = self.cross(
+            semantic,
+            forensic
+        )
+
+        semantic = self._check_finite("semantic_after_cross", semantic)
+        forensic = self._check_finite("forensic_after_cross", forensic)
+
+        semantic = torch.clamp(semantic, -20.0, 20.0)
+        forensic = torch.clamp(forensic, -20.0, 20.0)
+
+        fused = torch.cat(
+            [semantic, forensic],
+            dim=-1
+        )
+
+        fused = self._check_finite("fused", fused)
+        fused = self.norm_fused(torch.clamp(fused, -20.0, 20.0))
+        
+        # =====================================================
+        # 9. Forgery query decoder
+        # =====================================================
+        logits = self.decoder(fused)
+        logits = self._check_finite("raw_logits", logits)
+        logits = torch.clamp(logits, -30.0, 30.0)
+
+        pooled = fused.mean(dim=1)
+
+        return pooled, logits
+
+    def train(self, mode=True):
+        super().train(mode)
+
+        if self.freeze_xlsr:
+            self.xlsr.model.eval()
+            for p in self.xlsr.model.parameters():
+                p.requires_grad = False
+
+        if self.freeze_mert:
+            self.mert.model.eval()
+            for p in self.mert.model.parameters():
+                p.requires_grad = False
+
+        if self.freeze_beats:
+            self.beats.model.eval()
+            for p in self.beats.model.parameters():
+                p.requires_grad = False
+
+        return self
+
+    def eval(self):
+        super().eval()
+        return self
         
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
-    model = XLSRAASIST(model_dir="yourpath/huggingface/wav2vec2-xls-r-300m/",freeze=True).cuda()
-    feat, mu = model(feature)
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    trainable_params_in_million = trainable_params / 1e6
-    print(f"Trainable parameters (in million): {trainable_params_in_million:.2f}M")
-
+    print("model.py loaded successfully.")

@@ -1,20 +1,103 @@
 运行项目，别忘了剪切：数据集、huggingface、huggingface_cache
 
+第一步，冻结 XLSR / MERT / OpenBEATs，只训练 UFM 新模块：
+
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
 python main_train.py \
   --gpu 0 \
   --train_task atadd-track2 \
-  --model ft-w2v2aasist \
+  --model ufm-track2-full \
+  --xlsr /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/wav2vec2-xls-r-300m \
+  --mert /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/MERT-v1-330M \
+  --beats /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/OpenBEATs-ICME \
+  --ufm_freeze_xlsr \
+  --ufm_freeze_mert \
+  --ufm_freeze_beats \
+  --ufm_dim 512 \
+  --ufm_mem_slots 16 \
+  --ufm_heads 8 \
+  --ufm_layers 2 \
+  --ufm_dropout 0.1 \
+  --t2_return_type \
+  --ufm_type_loss 0.0 \
+  --ufm_router_entropy 0.0 \
+  --seed 1234 \
+  --batch_size 16 \
+  --lr 0.00001 \
+  --num_epochs 5 \
+  --interval 3 \
+  --save_best_by f1 \
+  --out_fold ./ckpt_t2/ufm_stage1a_ce_warmup
+  
+
+第二步，加载第一步最优模型，继续稳定微调UFM模块：
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+python main_train.py \
+  --gpu 0 \
+  --train_task atadd-track2 \
+  --model ufm-track2-full \
+  --init_from ./ckpt_t2/ufm_full_stage1/atadd_model.pt \
+  --xlsr /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/wav2vec2-xls-r-300m \
+  --mert /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/MERT-v1-330M \
+  --beats /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/OpenBEATs-ICME \
+  --ufm_freeze_xlsr \
+  --ufm_freeze_mert \
+  --ufm_freeze_beats \
+  --ufm_dim 512 \
+  --ufm_mem_slots 16 \
+  --ufm_heads 8 \
+  --ufm_layers 2 \
+  --ufm_dropout 0.1 \
   --t2_return_type \
   --t2_gdro \
-  --t2_gdro_eta 2.0 \
-  --t2_type_adv \
-  --t2_type_adv_weight 0.05 \
-  --t2_grl_lambda 1.0 \
-  --t2_type_feat_dim 160 \
+  --t2_gdro_eta 1.0 \
+  --ufm_type_loss 0.02 \
+  --ufm_router_entropy 0.002 \
   --seed 1234 \
-  --batch_size 14 \
-  --lr 0.000001 \
-  --num_epochs 10 \
-  --interval 2 \
+  --batch_size 16 \
+  --lr 0.000005 \
+  --num_epochs 6 \
+  --interval 3 \
   --save_best_by f1 \
-  --o ./ckpt_t2/gdro_adv_xlsr_aasist
+  --out_fold ./ckpt_t2/ufm_full_stage2
+  
+  
+
+  
+第三步，加载 Stage 2，冻结 XLSR，解冻 MERT + OpenBEATs：
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+python main_train.py \
+  --gpu 0 \
+  --train_task atadd-track2 \
+  --model ufm-track2-full \
+  --init_from ./ckpt_t2/ufm_full_stage2/atadd_model.pt \
+  --xlsr /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/wav2vec2-xls-r-300m \
+  --mert /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/MERT-v1-330M \
+  --beats /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/OpenBEATs-ICME \
+  --ufm_freeze_xlsr \
+  --ufm_dim 512 \
+  --ufm_mem_slots 16 \
+  --ufm_heads 8 \
+  --ufm_layers 2 \
+  --ufm_dropout 0.1 \
+  --t2_return_type \
+  --t2_gdro \
+  --t2_gdro_eta 1.0 \
+  --ufm_type_loss 0.01 \
+  --ufm_router_entropy 0.001 \
+  --seed 1234 \
+  --batch_size 8 \
+  --lr 0.000001 \
+  --num_epochs 5 \
+  --interval 3 \
+  --save_best_by f1 \
+  --out_fold ./ckpt_t2/ufm_full_stage3

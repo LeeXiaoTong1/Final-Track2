@@ -40,11 +40,15 @@ def initParams():
     # countermeasure
     parser.add_argument("--audio_len", type=int, help="raw waveform length", default=64600)
     parser.add_argument('-m', '--model', help='Model arch', default='pt-w2v2aasist',
-                        choices=['specresnet', 'aasist', 'ft-w2v2aasist', 'fr-wavlmaasist', 'fr-mertaasist',
-                                 'fr-w2v2aasist', 'ft-wavlmaasist', 'ft-mertaasist',
-                                 'pt-w2v2aasist', 'wpt-w2v2aasist',
-                                 'pt-wavlmaasist', 'wpt-wavlmaasist',
-                                 'pt-mertaasist', 'wpt-mertaasist', 't2-router-xlsr-mert',])
+                        choices=[
+                            'specresnet', 'aasist',
+                            'ft-w2v2aasist', 'fr-wavlmaasist', 'fr-mertaasist',
+                            'fr-w2v2aasist', 'ft-wavlmaasist', 'ft-mertaasist',
+                            'pt-w2v2aasist', 'wpt-w2v2aasist',
+                            'pt-wavlmaasist', 'wpt-wavlmaasist',
+                            'pt-mertaasist', 'wpt-mertaasist',
+                            't2-router-xlsr-mert',
+                            'ufaformer-full', 'ufm-track2-full',])
 
     # pt
     parser.add_argument("--prompt_dim", type=int, help="prompt dim", default=1024)
@@ -134,5 +138,103 @@ def initParams():
     )
 
     ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
+    
+    # =========================
+    # UFA-Former-Full
+    # =========================
+    parser.add_argument("--obeats", default="huggingface/OpenBEATs-ICME")
 
+    parser.add_argument("--ufa_freeze_xlsr", action="store_true")
+    parser.add_argument("--ufa_freeze_mert", action="store_true")
+    parser.add_argument("--ufa_freeze_obeats", action="store_true")
+
+    parser.add_argument("--ufa_hidden_dim", type=int, default=1024)
+    parser.add_argument("--ufa_router_hidden", type=int, default=256)
+    parser.add_argument("--ufa_num_heads", type=int, default=8)
+    parser.add_argument("--ufa_num_layers", type=int, default=2)
+    parser.add_argument("--ufa_dropout", type=float, default=0.1)
+
+    parser.add_argument("--ufa_type_loss", type=float, default=0.1)
+    parser.add_argument("--ufa_router_entropy", type=float, default=0.01)
+
+    parser.add_argument("--ufa_stft_n_fft", type=int, default=1024)
+    parser.add_argument("--ufa_stft_hop", type=int, default=320)
+
+    parser.add_argument("--init_from", type=str, default="")
+    
+    # =========================
+    # UFM-Track2-Full
+    # =========================
+    parser.add_argument(
+        "--beats",
+        default="/root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/OpenBEATs-ICME",
+        help="Path to BEATs/OpenBEATs/general-audio SSL model"
+    )
+
+    parser.add_argument(
+        "--ufm_dim",
+        type=int,
+        default=512,
+        help="Hidden dimension of UFM streams"
+    )
+
+    parser.add_argument(
+        "--ufm_mem_slots",
+        type=int,
+        default=16,
+        help="Number of memory slots for each forgery memory bank"
+    )
+
+    parser.add_argument(
+        "--ufm_heads",
+        type=int,
+        default=8,
+        help="Number of attention heads in UFM cross-stream transformer"
+    )
+
+    parser.add_argument(
+        "--ufm_layers",
+        type=int,
+        default=2,
+        help="Number of cross-stream transformer layers"
+    )
+
+    parser.add_argument(
+        "--ufm_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout in UFM modules"
+    )
+
+    parser.add_argument(
+        "--ufm_freeze_xlsr",
+        action="store_true",
+        help="Freeze XLSR expert"
+    )
+
+    parser.add_argument(
+        "--ufm_freeze_mert",
+        action="store_true",
+        help="Freeze MERT expert"
+    )
+
+    parser.add_argument(
+        "--ufm_freeze_beats",
+        action="store_true",
+        help="Freeze BEATs/OpenBEATs expert"
+    )
+
+    parser.add_argument(
+        "--ufm_type_loss",
+        type=float,
+        default=0.1,
+        help="Auxiliary type classification loss weight"
+    )
+
+    parser.add_argument(
+        "--ufm_router_entropy",
+        type=float,
+        default=0.01,
+        help="Router entropy regularization weight"
+    )
     return parser

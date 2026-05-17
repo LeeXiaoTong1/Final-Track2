@@ -55,7 +55,7 @@ def initParams():
         choices=['loss', 'eer', 'f1'],
         help='Metric used to save the best model: loss, eer, or f1'
     )
-
+    
     # generalized strategy
     parser.add_argument('--SAM', type=bool, default=False, help="use SAM")
     parser.add_argument('--ASAM', type=bool, default=False, help="use ASAM")
@@ -192,6 +192,46 @@ def router_entropy_loss(expert_weights):
     entropy = -(expert_weights * torch.log(expert_weights + 1e-8)).sum(dim=-1).mean()
     return entropy
 
+
+def find_bad_grads(model, max_print=30):
+    bad = []
+    for name, p in model.named_parameters():
+        if p.requires_grad and p.grad is not None:
+            if not torch.isfinite(p.grad).all():
+                g = p.grad.detach()
+                bad.append(name)
+                print(
+                    f"[BAD GRAD] {name} | "
+                    f"shape={tuple(g.shape)} | "
+                    f"nan={torch.isnan(g).any().item()} | "
+                    f"inf={torch.isinf(g).any().item()} | "
+                    f"min={torch.nan_to_num(g).min().item():.4e} | "
+                    f"max={torch.nan_to_num(g).max().item():.4e}"
+                )
+                if len(bad) >= max_print:
+                    break
+    return bad
+
+
+def find_bad_params(model, max_print=30):
+    bad = []
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            if not torch.isfinite(p).all():
+                bad.append(name)
+                x = p.detach()
+                print(
+                    f"[BAD PARAM] {name} | "
+                    f"shape={tuple(x.shape)} | "
+                    f"nan={torch.isnan(x).any().item()} | "
+                    f"inf={torch.isinf(x).any().item()} | "
+                    f"min={torch.nan_to_num(x).min().item():.4e} | "
+                    f"max={torch.nan_to_num(x).max().item():.4e}"
+                )
+                if len(bad) >= max_print:
+                    break
+    return bad
+
 ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
 
 def shuffle(feat, labels):
@@ -229,6 +269,29 @@ def train(args):
         feat_model = WAVLMAASIST(model_dir=args.wavlm, freeze=False).to(args.device)
     if args.model == 'ft-mertaasist':
         feat_model = MERTAASIST(model_dir=args.mert, freeze=False).to(args.device)
+    if args.model == "ufm-track2-full":
+        feat_model = UFMTrack2Full(
+            xlsr_dir=args.xlsr,
+            mert_dir=args.mert,
+            beats_dir=args.beats,
+            device=args.device,
+            freeze_xlsr=args.ufm_freeze_xlsr,
+            freeze_mert=args.ufm_freeze_mert,
+            freeze_beats=args.ufm_freeze_beats,
+            dim=args.ufm_dim,
+            mem_slots=args.ufm_mem_slots,
+            heads=args.ufm_heads,
+            layers=args.ufm_layers,
+            dropout=args.ufm_dropout
+        ).to(args.device)
+        
+    if getattr(args, "init_from", ""):
+        print(f"Loading initialization checkpoint from: {args.init_from}")
+        ckpt = torch.load(args.init_from, map_location=args.device)
+        missing, unexpected = feat_model.load_state_dict(ckpt, strict=False)
+        print("Missing keys:", missing)
+        print("Unexpected keys:", unexpected)
+        
     ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
     if args.model == 't2-router-xlsr-mert':
         feat_model = TypeRoutedXLSRMERTAASIST(
@@ -318,7 +381,8 @@ def train(args):
             args.t2_return_type or
             args.t2_gdro or
             args.t2_type_adv or
-            args.t2_router_type_loss > 0
+            args.t2_router_type_loss > 0 or
+            getattr(args, "ufm_type_loss", 0) > 0
         )
 
         atadd_t2_trainset = atadd_dataset(
@@ -492,9 +556,78 @@ def train(args):
                     ent = router_entropy_loss(feat_model.latest_expert_weights)
                     feat_loss = feat_loss - args.t2_router_entropy * ent
 
+                # ======================================================
+                # Optional: UFM auxiliary type loss
+                # ======================================================
+                if (
+                    args.train_task == "atadd-track2"
+                    and getattr(args, "ufm_type_loss", 0) > 0
+                    and type_ids is not None
+                    and hasattr(feat_model, "latest_type_logits")
+                    and feat_model.latest_type_logits is not None
+                ):
+                    loss_ufm_type = F.cross_entropy(
+                        feat_model.latest_type_logits,
+                        type_ids
+                    )
+
+                    feat_loss = feat_loss + args.ufm_type_loss * loss_ufm_type
+
+                # ======================================================
+                # Optional: UFM router entropy regularization
+                # ======================================================
+                if (
+                    args.train_task == "atadd-track2"
+                    and getattr(args, "ufm_router_entropy", 0) > 0
+                    and hasattr(feat_model, "latest_expert_weights")
+                    and feat_model.latest_expert_weights is not None
+                ):
+                    ent = router_entropy_loss(
+                        feat_model.latest_expert_weights
+                    )
+
+                    feat_loss = feat_loss - args.ufm_router_entropy * ent
+                    
+                if not torch.isfinite(feat_loss):
+                    print(
+                        f"[skip non-finite loss] epoch={epoch_num}, step={i}, "
+                        f"loss={feat_loss.item()}"
+                    )
+                    feat_optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 feat_loss.backward()
+
+                bad_grads = find_bad_grads(feat_model)
+
+                if len(bad_grads) > 0:
+                    print(f"[STOP] non-finite gradients at epoch={epoch_num}, step={i}")
+                    feat_optimizer.zero_grad(set_to_none=True)
+                    raise RuntimeError(f"Non-finite gradients found: {bad_grads[:10]}")
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    feat_model.parameters(),
+                    max_norm=1.0,
+                    error_if_nonfinite=False
+                )
+
+                if not torch.isfinite(grad_norm):
+                    print(
+                        f"[skip non-finite grad_norm] epoch={epoch_num}, step={i}, "
+                        f"grad_norm={grad_norm}"
+                    )
+                    feat_optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 feat_optimizer.step()
-            ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
+
+                bad_params = find_bad_params(feat_model)
+
+                if len(bad_params) > 0:
+                    print(f"[STOP] non-finite parameters after step epoch={epoch_num}, step={i}")
+                    raise RuntimeError(f"Non-finite parameters found: {bad_params[:10]}")
+
+            
 
             trainlossDict['base_loss'].append(feat_loss.item())
 
