@@ -26,11 +26,11 @@ python main_train.py \
   --ufm_router_entropy 0.0 \
   --seed 1234 \
   --batch_size 16 \
-  --lr 0.00001 \
-  --num_epochs 5 \
+  --lr 0.000005 \
+  --num_epochs 3 \
   --interval 3 \
   --save_best_by f1 \
-  --out_fold ./ckpt_t2/ufm_stage1a_ce_warmup
+  --out_fold ./ckpt_t2/ufm_stage1_ce
   
 
 第二步，加载第一步最优模型，继续稳定微调UFM模块：
@@ -42,7 +42,7 @@ python main_train.py \
   --gpu 0 \
   --train_task atadd-track2 \
   --model ufm-track2-full \
-  --init_from ./ckpt_t2/ufm_full_stage1/atadd_model.pt \
+  --init_from ./ckpt_t2/ufm_stage1_stable_ce/atadd_model.pt \
   --xlsr /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/wav2vec2-xls-r-300m \
   --mert /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/MERT-v1-330M \
   --beats /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/OpenBEATs-ICME \
@@ -52,20 +52,20 @@ python main_train.py \
   --ufm_dim 512 \
   --ufm_mem_slots 16 \
   --ufm_heads 8 \
-  --ufm_layers 2 \
+  --ufm_layers 0 \
   --ufm_dropout 0.1 \
   --t2_return_type \
   --t2_gdro \
-  --t2_gdro_eta 1.0 \
-  --ufm_type_loss 0.02 \
-  --ufm_router_entropy 0.002 \
+  --t2_gdro_eta 0.05 \
+  --ufm_type_loss 0.0 \
+  --ufm_router_entropy 0.0 \
   --seed 1234 \
   --batch_size 16 \
-  --lr 0.000005 \
-  --num_epochs 6 \
+  --lr 0.0000005 \
+  --num_epochs 5 \
   --interval 3 \
   --save_best_by f1 \
-  --out_fold ./ckpt_t2/ufm_full_stage2
+  --out_fold ./ckpt_t2/ufm_stage2_gdro_safe
   
   
 
@@ -79,7 +79,7 @@ python main_train.py \
   --gpu 0 \
   --train_task atadd-track2 \
   --model ufm-track2-full \
-  --init_from ./ckpt_t2/ufm_full_stage2/atadd_model.pt \
+  --init_from ./ckpt_t2/ufm_stage2_gdro_safe/atadd_model.pt \
   --xlsr /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/wav2vec2-xls-r-300m \
   --mert /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/MERT-v1-330M \
   --beats /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/OpenBEATs-ICME \
@@ -87,17 +87,17 @@ python main_train.py \
   --ufm_dim 512 \
   --ufm_mem_slots 16 \
   --ufm_heads 8 \
-  --ufm_layers 2 \
+  --ufm_layers 0 \
   --ufm_dropout 0.1 \
   --t2_return_type \
   --t2_gdro \
-  --t2_gdro_eta 1.0 \
-  --ufm_type_loss 0.01 \
-  --ufm_router_entropy 0.001 \
+  --t2_gdro_eta 0.03 \
+  --ufm_type_loss 0.0 \
+  --ufm_router_entropy 0.0 \
   --seed 1234 \
   --batch_size 8 \
-  --lr 0.000001 \
+  --lr 0.0000001 \
   --num_epochs 5 \
   --interval 3 \
   --save_best_by f1 \
-  --out_fold ./ckpt_t2/ufm_full_stage3
+  --out_fold ./ckpt_t2/ufm_stage3_final_mert_obeats_ft

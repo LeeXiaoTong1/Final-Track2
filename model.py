@@ -1429,13 +1429,14 @@ class FullForgeryMemory(nn.Module):
     
 class FullExpertRouter(nn.Module):
     """
-    Uncertainty-aware expert router.
+    Stable uncertainty-aware router.
 
-    Experts:
-        0 XLSR
-        1 MERT
-        2 BEATs/OpenBEATs
-        3 Artifact/Memory stream
+    It separates:
+        1. semantic routing among XLSR / MERT / OpenBEats
+        2. artifact gate for Artifact/Memory stream
+
+    This avoids unstable re-normalization:
+        sem_w = expert_w[:, :3] / expert_w[:, :3].sum()
     """
     def __init__(
         self,
@@ -1448,21 +1449,26 @@ class FullExpertRouter(nn.Module):
 
         in_dim = dim * 7
 
-        self.router = nn.Sequential(
+        self.shared = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, dim),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim, n_experts)
+            nn.Dropout(dropout)
         )
 
-        self.type_head = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim, n_types)
-        )
+        # Three-way semantic expert router:
+        # XLSR / MERT / OpenBEats
+        self.semantic_head = nn.Linear(dim, 3)
+
+        # One scalar artifact gate
+        self.artifact_head = nn.Linear(dim, 1)
+
+        # Auxiliary type classifier
+        self.type_head = nn.Linear(dim, n_types)
+
+        # Initialize artifact gate close to neutral.
+        nn.init.zeros_(self.artifact_head.weight)
+        nn.init.zeros_(self.artifact_head.bias)
 
     def forward(
         self,
@@ -1473,26 +1479,33 @@ class FullExpertRouter(nn.Module):
         f_pool,
         mem_gap
     ):
-        """
-        x_pool: [B, D]
-        m_pool: [B, D]
-        b_pool: [B, D]
-        a_pool: [B, D]
-        f_pool: [B, D]
-        mem_gap: [B, 2D]
-        """
         h = torch.cat(
             [x_pool, m_pool, b_pool, a_pool, f_pool, mem_gap],
             dim=-1
-        )  # [B, 7D]
+        )
 
-        expert_logits = self.router(h)
-        type_logits = self.type_head(h)
+        z = self.shared(h)
 
-        expert_weights = torch.softmax(expert_logits, dim=-1)
+        semantic_logits = self.semantic_head(z)
+        semantic_weights = torch.softmax(semantic_logits, dim=-1)
+
+        artifact_logit = self.artifact_head(z)
+        artifact_gate = torch.sigmoid(artifact_logit)
+
+        # For logging compatibility: [xlsr, mert, beats, artifact]
+        # semantic mass = 1 - artifact_gate
+        expert_weights = torch.cat(
+            [
+                (1.0 - artifact_gate) * semantic_weights,
+                artifact_gate
+            ],
+            dim=-1
+        )
+
+        type_logits = self.type_head(z)
         type_prob = torch.softmax(type_logits, dim=-1)
 
-        return expert_weights, type_logits, type_prob
+        return expert_weights, type_logits, type_prob, semantic_weights, artifact_gate
     
 class CrossStreamFusionBlock(nn.Module):
     """
@@ -1632,55 +1645,47 @@ class BiCrossStreamTransformer(nn.Module):
     
 class ForgeryQueryDecoder(nn.Module):
     """
-    Learnable real/fake query decoder.
+    Stable pooling decoder for UFM.
+
+    Replace learnable-query MultiheadAttention with mean+max pooling.
+    This avoids attention-backward NaN in the final common path.
     """
     def __init__(
         self,
         dim=1024,
-        heads=8,
+        heads=8,      # kept for compatibility, not used
         dropout=0.1
     ):
         super(ForgeryQueryDecoder, self).__init__()
 
-        self.queries = nn.Parameter(torch.randn(2, dim) * 0.02)
-
-        self.attn = nn.MultiheadAttention(
-            embed_dim=dim,
-            num_heads=heads,
-            dropout=dropout,
-            batch_first=True
-        )
+        hidden = max(dim // 2, 256)
 
         self.norm = nn.LayerNorm(dim)
 
         self.cls = nn.Sequential(
-            nn.Linear(dim * 2, dim),
+            nn.Linear(dim * 2, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim, 2)
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, 2)
         )
+
+        # Mildly stable init for the last classifier.
+        nn.init.zeros_(self.cls[-1].weight)
+        nn.init.zeros_(self.cls[-1].bias)
 
     def forward(self, tokens):
-        B = tokens.size(0)
+        """
+        tokens: [B, T, D]
+        """
+        tokens = self.norm(tokens)
 
-        q = self.queries.unsqueeze(0).expand(B, -1, -1)
+        mean_pool = tokens.mean(dim=1)
+        max_pool = tokens.max(dim=1).values
 
-        q_out, _ = self.attn(
-            query=q,
-            key=tokens,
-            value=tokens,
-            need_weights=False
-        )
+        pooled = torch.cat([mean_pool, max_pool], dim=-1)
 
-        q_out = self.norm(q_out)
-
-        real_q = q_out[:, 0]
-        fake_q = q_out[:, 1]
-
-        logits = self.cls(
-            torch.cat([real_q, fake_q], dim=-1)
-        )
-
+        logits = self.cls(pooled)
         return logits
     
 class UFMTrack2Full(nn.Module):
@@ -1903,7 +1908,7 @@ class UFMTrack2Full(nn.Module):
         a_pool = a.mean(dim=1)
         f_pool = a_mem.mean(dim=1)
 
-        expert_w, type_logits, type_prob = self.router(
+        expert_w, type_logits, type_prob, sem_w, art_gate = self.router(
             x_pool,
             m_pool,
             b_pool,
@@ -1911,7 +1916,10 @@ class UFMTrack2Full(nn.Module):
             f_pool,
             mem_gap
         )
+
         expert_w = self._check_finite("expert_w", expert_w)
+        sem_w = self._check_finite("sem_w", sem_w)
+        art_gate = self._check_finite("art_gate", art_gate)
         type_logits = self._check_finite("type_logits", type_logits)
         type_prob = self._check_finite("type_prob", type_prob)
 
@@ -1934,9 +1942,6 @@ class UFMTrack2Full(nn.Module):
         # =====================================================
         # 6. Semantic expert fusion
         # =====================================================
-        sem_w = expert_w[:, :3]
-        sem_w = sem_w / (sem_w.sum(dim=-1, keepdim=True) + 1e-8)
-
         semantic = (
             sem_w[:, 0].view(-1, 1, 1) * x +
             sem_w[:, 1].view(-1, 1, 1) * m +
@@ -1946,13 +1951,12 @@ class UFMTrack2Full(nn.Module):
         # =====================================================
         # 7. Forensic fusion
         # =====================================================
-        art_gate = expert_w[:, 3].view(-1, 1, 1)
+        art_gate = art_gate.view(-1, 1, 1)
 
         forensic = (
             art_gate * a_mem +
             (1.0 - art_gate) * a
         )
-
         # =====================================================
         # 8. Cross-stream interaction
         # =====================================================
