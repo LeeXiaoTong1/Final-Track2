@@ -237,35 +237,4 @@ def initParams():
         default=0.01,
         help="Router entropy regularization weight"
     )
-    
-    # =========================
-    # Track2 multi-crop training
-    # =========================
-    parser.add_argument(
-        "--train_crop_mode",
-        type=str,
-        default="random",
-        choices=["head", "center", "random"],
-        help="Crop mode for training audio."
-    )
-    parser.add_argument(
-        "--dev_crop_mode",
-        type=str,
-        default="head",
-        choices=["head", "center", "random"],
-        help="Crop mode for dev audio during in-training validation."
-    )
-    parser.add_argument(
-        "--train_num_crops",
-        type=int,
-        default=1,
-        help="Number of random crops per training audio. Use 2 for crop-consistency training."
-    )
-    parser.add_argument(
-        "--crop_consistency_weight",
-        type=float,
-        default=0.0,
-        help="KL consistency weight among multiple crops from the same audio."
-    )
-
     return parser

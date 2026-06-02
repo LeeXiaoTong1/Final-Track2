@@ -1509,12 +1509,11 @@ class FullExpertRouter(nn.Module):
     
 class CrossStreamFusionBlock(nn.Module):
     """
-    Stable gated semantic-forensic cross interaction.
+    Singing-safe stable semantic-forensic cross interaction.
 
     This replaces the original bidirectional MultiheadAttention block.
-    It keeps --ufm_layers 1 meaningful while avoiding the MHA backward NaN
-    observed in UFM Track2 training. The block starts close to identity,
-    so strong baseline-like Singing cues are less likely to be overwritten.
+    It keeps --ufm_layers 1 meaningful, but avoids MHA backward NaN
+    and starts almost as an identity mapping to protect the strong Singing branch.
     """
     def __init__(self, dim=512, num_heads=8, dropout=0.1):
         super(CrossStreamFusionBlock, self).__init__()
@@ -1523,12 +1522,14 @@ class CrossStreamFusionBlock(nn.Module):
         self.sem_norm = nn.LayerNorm(dim)
         self.for_norm = nn.LayerNorm(dim)
 
+        # Context = mean + max pooling. More stable than token-to-token attention.
         self.sem_ctx = nn.Sequential(
             nn.LayerNorm(dim * 2),
             nn.Linear(dim * 2, dim),
             nn.GELU(),
             nn.Linear(dim, dim)
         )
+
         self.for_ctx = nn.Sequential(
             nn.LayerNorm(dim * 2),
             nn.Linear(dim * 2, dim),
@@ -1536,6 +1537,7 @@ class CrossStreamFusionBlock(nn.Module):
             nn.Linear(dim, dim)
         )
 
+        # forensic context -> semantic tokens
         self.for_to_sem_delta = nn.Sequential(
             nn.LayerNorm(dim * 2),
             nn.Linear(dim * 2, dim),
@@ -1548,6 +1550,7 @@ class CrossStreamFusionBlock(nn.Module):
             nn.Linear(dim * 2, dim)
         )
 
+        # semantic context -> forensic tokens
         self.sem_to_for_delta = nn.Sequential(
             nn.LayerNorm(dim * 2),
             nn.Linear(dim * 2, dim),
@@ -1560,7 +1563,7 @@ class CrossStreamFusionBlock(nn.Module):
             nn.Linear(dim * 2, dim)
         )
 
-        # Very small learnable residual strengths. Upper bound = 0.02.
+        # Very small residual strength. This is important for Singing protection.
         self.raw_cross_scale = nn.Parameter(torch.tensor(-4.0))
         self.raw_ffn_scale = nn.Parameter(torch.tensor(-4.0))
 
@@ -1571,6 +1574,7 @@ class CrossStreamFusionBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(dim * 2, dim)
         )
+
         self.for_ffn = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, dim * 2),
@@ -1582,17 +1586,18 @@ class CrossStreamFusionBlock(nn.Module):
         self._stable_init()
 
     def _stable_init(self):
-        # Delta/FFN branches start at exact zero: initial block = identity.
+        # Cross update starts as exact zero, so the block is initially identity.
         nn.init.zeros_(self.for_to_sem_delta[-1].weight)
         nn.init.zeros_(self.for_to_sem_delta[-1].bias)
         nn.init.zeros_(self.sem_to_for_delta[-1].weight)
         nn.init.zeros_(self.sem_to_for_delta[-1].bias)
+
         nn.init.zeros_(self.sem_ffn[-1].weight)
         nn.init.zeros_(self.sem_ffn[-1].bias)
         nn.init.zeros_(self.for_ffn[-1].weight)
         nn.init.zeros_(self.for_ffn[-1].bias)
 
-        # Gates start very small.
+        # Small gates at initialization.
         nn.init.zeros_(self.for_to_sem_gate[-1].weight)
         nn.init.constant_(self.for_to_sem_gate[-1].bias, -3.0)
         nn.init.zeros_(self.sem_to_for_gate[-1].weight)
@@ -1616,13 +1621,18 @@ class CrossStreamFusionBlock(nn.Module):
         sem_in = torch.cat([sem, for_c], dim=-1)
         for_in = torch.cat([forg, sem_c], dim=-1)
 
-        sem_delta = torch.clamp(self._finite_or_zero(self.for_to_sem_delta(sem_in)), -5.0, 5.0)
-        for_delta = torch.clamp(self._finite_or_zero(self.sem_to_for_delta(for_in)), -5.0, 5.0)
+        sem_delta = self._finite_or_zero(self.for_to_sem_delta(sem_in))
+        for_delta = self._finite_or_zero(self.sem_to_for_delta(for_in))
+
+        sem_delta = torch.clamp(sem_delta, -5.0, 5.0)
+        for_delta = torch.clamp(for_delta, -5.0, 5.0)
 
         sem_gate = torch.sigmoid(self.for_to_sem_gate(sem_in))
         for_gate = torch.sigmoid(self.sem_to_for_gate(for_in))
 
+        # Max residual coefficient is only 0.02.
         cross_alpha = 0.02 * torch.sigmoid(self.raw_cross_scale)
+
         semantic_tokens = semantic_tokens + cross_alpha * sem_gate * sem_delta
         forensic_tokens = forensic_tokens + cross_alpha * for_gate * for_delta
 
@@ -1630,11 +1640,13 @@ class CrossStreamFusionBlock(nn.Module):
         for_ffn = torch.clamp(self._finite_or_zero(self.for_ffn(forensic_tokens)), -5.0, 5.0)
 
         ffn_alpha = 0.02 * torch.sigmoid(self.raw_ffn_scale)
+
         semantic_tokens = semantic_tokens + ffn_alpha * sem_ffn
         forensic_tokens = forensic_tokens + ffn_alpha * for_ffn
 
         semantic_tokens = self._finite_or_zero(semantic_tokens)
         forensic_tokens = self._finite_or_zero(forensic_tokens)
+
         return semantic_tokens, forensic_tokens
 
 

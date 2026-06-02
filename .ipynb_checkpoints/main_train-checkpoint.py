@@ -29,6 +29,34 @@ torch.multiprocessing.set_start_method('spawn', force=True)
 def initParams():
     parser = config.initParams()
 
+    def add_arg_if_absent(*names, **kwargs):
+        existing = set()
+        for action in parser._actions:
+            existing.update(action.option_strings)
+        if all(name not in existing for name in names):
+            parser.add_argument(*names, **kwargs)
+
+    # =========================
+    # Track2 All-95 optimization additions
+    # =========================
+    add_arg_if_absent('--train_crop_mode', type=str, default='random', choices=['head', 'center', 'random'])
+    add_arg_if_absent('--dev_crop_mode', type=str, default='head', choices=['head', 'center', 'random'])
+    add_arg_if_absent('--train_num_crops', type=int, default=1)
+    add_arg_if_absent('--crop_consistency_weight', type=float, default=0.0)
+
+    add_arg_if_absent('--t2_gdro_weak3', action='store_true', help='Apply GDRO only to speech/sound/music, excluding singing.')
+    add_arg_if_absent('--t2_target_floor', type=float, default=0.95, help='Target per-type F1 floor used by all95_f1 checkpoint selection.')
+    add_arg_if_absent('--t2_floor_penalty', type=float, default=2.0, help='Penalty strength for types below t2_target_floor.')
+    add_arg_if_absent('--t2_singing_floor', type=float, default=0.94, help='Singing F1 floor used by safe_f1 checkpoint selection.')
+    add_arg_if_absent('--t2_singing_penalty', type=float, default=1.5, help='Penalty if singing F1 is below t2_singing_floor.')
+
+    add_arg_if_absent('--t2_teacher_model', type=str, default='ft-w2v2aasist', choices=['ft-w2v2aasist', 'fr-w2v2aasist', 'wpt-w2v2aasist'])
+    add_arg_if_absent('--t2_sing_teacher_ckpt', type=str, default='', help='Checkpoint of baseline teacher used to protect Singing.')
+    add_arg_if_absent('--t2_sing_anchor_weight', type=float, default=0.0, help='Singing-only distillation loss weight.')
+    add_arg_if_absent('--t2_sing_anchor_temp', type=float, default=2.0, help='Temperature for singing teacher KL.')
+    add_arg_if_absent('--t2_sing_anchor_margin_weight', type=float, default=0.2, help='Margin alignment weight in singing teacher loss.')
+    add_arg_if_absent('--t2_sing_anchor_correct_only', action='store_true', help='Only distill teacher on singing samples that teacher predicts correctly.')
+
     # Training hyperparameters
     parser.add_argument('--num_epochs', type=int, default=20, help="Number of epochs for training")
     parser.add_argument('--batch_size', type=int, default=64, help="Mini batch size for training")
@@ -52,8 +80,8 @@ def initParams():
         '--save_best_by',
         type=str,
         default='loss',
-        choices=['loss', 'eer', 'f1'],
-        help='Metric used to save the best model: loss, eer, or f1'
+        choices=['loss', 'eer', 'f1', 'safe_f1', 'weak3_f1', 'min4_f1', 'all95_f1'],
+        help='Metric used to save the best model: loss, eer, f1, safe_f1, weak3_f1, min4_f1, or all95_f1'
     )
     
     # generalized strategy
@@ -125,10 +153,19 @@ def unpack_batch(batch, device):
     return feat, audio_fn, labels, type_ids
 
 
-def type_group_dro_ce_loss(outputs, labels, type_ids, class_weight=None, eta=2.0, n_types=4):
+def type_group_dro_ce_loss(
+    outputs,
+    labels,
+    type_ids,
+    class_weight=None,
+    eta=2.0,
+    n_types=4,
+    active_types=None
+):
     """
-    Type-balanced GroupDRO:
-    compute CE loss per audio type and emphasize the worst type.
+    Type-balanced GroupDRO.
+    If active_types is given, only those audio types contribute to DRO.
+    This is used to optimize weak3 = speech/sound/music while teacher anchor protects Singing.
     """
     sample_losses = F.cross_entropy(
         outputs,
@@ -137,23 +174,23 @@ def type_group_dro_ce_loss(outputs, labels, type_ids, class_weight=None, eta=2.0
         reduction="none"
     )
 
-    group_losses = []
-    valid_types = []
+    if active_types is None:
+        active_types = list(range(n_types))
 
-    for t in range(n_types):
-        mask = (type_ids == t)
+    group_losses = []
+
+    for t in active_types:
+        mask = (type_ids == int(t))
         if mask.any():
             group_losses.append(sample_losses[mask].mean())
-            valid_types.append(t)
 
     if len(group_losses) == 0:
         return sample_losses.mean()
 
     group_losses = torch.stack(group_losses)
     group_weights = torch.softmax(eta * group_losses.detach(), dim=0)
+    return (group_weights * group_losses).sum()
 
-    loss = (group_weights * group_losses).sum()
-    return loss
 
 
 def track2_macro_f1_by_type(labels, preds, type_ids, n_types=4):
@@ -192,6 +229,183 @@ def router_entropy_loss(expert_weights):
     entropy = -(expert_weights * torch.log(expert_weights + 1e-8)).sum(dim=-1).mean()
     return entropy
 
+
+def build_track2_teacher(args):
+    """
+    Build a frozen baseline teacher for Singing protection.
+    Recommended teacher: FT-XLSR-AASIST checkpoint that keeps Singing near baseline high score.
+    """
+    ckpt_path = getattr(args, "t2_sing_teacher_ckpt", "")
+    if not ckpt_path:
+        return None
+
+    model_name = getattr(args, "t2_teacher_model", "ft-w2v2aasist")
+
+    if model_name == "ft-w2v2aasist":
+        teacher = XLSRAASIST(model_dir=args.xlsr, freeze=False).to(args.device)
+    elif model_name == "fr-w2v2aasist":
+        teacher = XLSRAASIST(model_dir=args.xlsr, freeze=True).to(args.device)
+    elif model_name == "wpt-w2v2aasist":
+        teacher = WPTW2V2AASIST(
+            model_dir=args.xlsr,
+            prompt_dim=args.prompt_dim,
+            num_prompt_tokens=args.num_prompt_tokens,
+            num_wavelet_tokens=args.num_wavelet_tokens,
+            dropout=args.pt_dropout
+        ).to(args.device)
+    else:
+        raise ValueError(f"Unsupported teacher model: {model_name}")
+
+    print(f"[SingingTeacher] model={model_name}, ckpt={ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=args.device)
+    missing, unexpected = teacher.load_state_dict(ckpt, strict=False)
+    print("[SingingTeacher] missing keys:", missing)
+    print("[SingingTeacher] unexpected keys:", unexpected)
+
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    return teacher
+
+
+def singing_teacher_anchor_loss(
+    student_logits,
+    teacher_logits,
+    labels,
+    type_ids,
+    temp=2.0,
+    margin_weight=0.2,
+    correct_only=False
+):
+    """
+    Distill only Singing samples from the baseline teacher.
+    Label convention: 0 = real, 1 = fake.
+    """
+    if type_ids is None:
+        return student_logits.new_tensor(0.0)
+
+    mask = (type_ids == 2)
+    if correct_only:
+        teacher_pred = torch.argmax(teacher_logits.detach(), dim=1)
+        mask = mask & (teacher_pred == labels)
+
+    if not mask.any():
+        return student_logits.new_tensor(0.0)
+
+    s = student_logits[mask]
+    t = teacher_logits[mask].detach()
+
+    kl = F.kl_div(
+        F.log_softmax(s / temp, dim=-1),
+        F.softmax(t / temp, dim=-1),
+        reduction="batchmean"
+    ) * (temp * temp)
+
+    s_margin = s[:, 0] - s[:, 1]
+    t_margin = t[:, 0] - t[:, 1]
+    margin = F.smooth_l1_loss(s_margin, t_margin)
+
+    return kl + margin_weight * margin
+
+
+def compute_floor_scores(type_f1s, avg_f1, floor=0.95, penalty=2.0, singing_floor=0.94, singing_penalty=1.5):
+    """
+    Returns:
+      weak3_f1: mean(speech, sound, music)
+      min4_f1: min over all four types
+      all95_f1: avg_f1 penalized by deficits under target floor
+      safe_f1: avg_f1 penalized by Singing deficit only
+    """
+    if type_f1s is None or len(type_f1s) < 4:
+        return avg_f1, avg_f1, avg_f1, avg_f1
+
+    f = [float(x) for x in type_f1s]
+    weak3_f1 = float(np.mean([f[0], f[1], f[3]]))
+    min4_f1 = float(np.min(f))
+    deficits = [max(0.0, float(floor) - x) for x in f]
+    all95_f1 = float(avg_f1) - float(penalty) * float(np.mean(deficits))
+    sing_gap = max(0.0, float(singing_floor) - f[2])
+    safe_f1 = float(avg_f1) - float(singing_penalty) * sing_gap
+    return weak3_f1, min4_f1, all95_f1, safe_f1
+
+
+
+
+def forward_maybe_multicrop(args, feat_model, feat):
+    """
+    Support:
+      feat: [B, L]    -> standard single-crop training
+      feat: [B, K, L] -> multi-crop training
+
+    Return:
+      feats: sample-level features
+      feat_outputs: sample-level logits
+      crop_consistency_loss: scalar tensor
+    """
+    crop_consistency_loss = feat.new_tensor(0.0)
+
+    if feat.dim() != 3:
+        feats, feat_outputs = feat_model(feat)
+        return feats, feat_outputs, crop_consistency_loss
+
+    B, K, L = feat.shape
+    flat_feat = feat.reshape(B * K, L)
+
+    feats_flat, logits_flat = feat_model(flat_feat)
+
+    if logits_flat.dim() == 1:
+        logits_flat = logits_flat.unsqueeze(-1)
+
+    logits = logits_flat.view(B, K, -1)
+    feat_outputs = logits.mean(dim=1)
+
+    # UFM auxiliary outputs are generated at crop level; convert them back
+    # to sample level so CE/type losses match type_ids with shape [B].
+    if (
+        hasattr(feat_model, "latest_type_logits")
+        and feat_model.latest_type_logits is not None
+    ):
+        feat_model.latest_type_logits = (
+            feat_model.latest_type_logits.view(B, K, -1).mean(dim=1)
+        )
+
+    if (
+        hasattr(feat_model, "latest_expert_weights")
+        and feat_model.latest_expert_weights is not None
+    ):
+        expert_weights = feat_model.latest_expert_weights.view(B, K, -1).mean(dim=1)
+        expert_weights = expert_weights / expert_weights.sum(
+            dim=-1,
+            keepdim=True
+        ).clamp_min(1e-8)
+        feat_model.latest_expert_weights = expert_weights
+
+    # Pool backbone features to sample level.
+    if feats_flat.dim() == 2:
+        feats = feats_flat.view(B, K, -1).mean(dim=1)
+    elif feats_flat.dim() == 3:
+        feats = feats_flat.view(B, K, feats_flat.size(1), feats_flat.size(2)).mean(dim=1)
+    else:
+        feats = feats_flat
+
+    # Crop consistency: different crops from the same audio should not
+    # produce strongly contradictory real/fake predictions.
+    if getattr(args, "crop_consistency_weight", 0.0) > 0 and K > 1:
+        if logits.size(-1) > 1:
+            p_crop = F.softmax(logits, dim=-1)
+            p_mean = p_crop.mean(dim=1, keepdim=True).detach()
+            crop_consistency_loss = F.kl_div(
+                F.log_softmax(logits, dim=-1),
+                p_mean.expand_as(p_crop),
+                reduction="batchmean"
+            )
+        else:
+            p_crop = torch.sigmoid(logits)
+            p_mean = p_crop.mean(dim=1, keepdim=True).detach()
+            crop_consistency_loss = F.mse_loss(p_crop, p_mean.expand_as(p_crop))
+
+    return feats, feat_outputs, crop_consistency_loss
 
 def find_bad_grads(model, max_print=30):
     bad = []
@@ -247,6 +461,9 @@ def train(args):
     ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
     if args.train_task == "atadd-track2" and (args.t2_gdro or args.t2_type_adv) and (args.SAM or args.ASAM or args.CSAM):
         raise ValueError("Do not mix Track2 GDRO/type-adversarial training with SAM/ASAM/CSAM in the first version.")
+
+    if (args.SAM or args.ASAM or args.CSAM) and int(getattr(args, "train_num_crops", 1)) > 1:
+        raise ValueError("Multi-crop training is only implemented for the normal optimizer branch, not SAM/ASAM/CSAM.")
     ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
 
     # initialize model
@@ -329,6 +546,9 @@ def train(args):
         ).to(args.device)
     ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
     
+    # Singing teacher is a separate frozen model, not part of feat_model optimizer.
+    singing_teacher = build_track2_teacher(args)
+
     feat_optimizer = torch.optim.Adam(
         feat_model.parameters(),
         lr=args.lr,
@@ -378,25 +598,31 @@ def train(args):
     ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
     if args.train_task == "atadd-track2":
         need_type_id = (
-            args.t2_return_type or
-            args.t2_gdro or
-            args.t2_type_adv or
-            args.t2_router_type_loss > 0 or
-            getattr(args, "ufm_type_loss", 0) > 0
+            getattr(args, "t2_return_type", False) or
+            getattr(args, "t2_gdro", False) or
+            getattr(args, "t2_type_adv", False) or
+            getattr(args, "t2_router_type_loss", 0) > 0 or
+            getattr(args, "ufm_type_loss", 0) > 0 or
+            getattr(args, "t2_sing_anchor_weight", 0.0) > 0 or
+            getattr(args, "t2_gdro_weak3", False)
         )
 
         atadd_t2_trainset = atadd_dataset(
             args.atadd_t2_train_audio,
             args.atadd_t2_train_label,
             audio_length=args.audio_len,
-            return_type=need_type_id
+            return_type=need_type_id,
+            crop_mode=getattr(args, "train_crop_mode", "head"),
+            num_crops=getattr(args, "train_num_crops", 1)
         )
 
         atadd_t2_devset = atadd_dataset(
             args.atadd_t2_dev_audio,
             args.atadd_t2_dev_label,
             audio_length=args.audio_len,
-            return_type=need_type_id
+            return_type=need_type_id,
+            crop_mode=getattr(args, "dev_crop_mode", "head"),
+            num_crops=1
         )
 
         train_set = [atadd_t2_trainset]
@@ -442,6 +668,14 @@ def train(args):
 
     print(f"Using class weight: {weight.tolist()}")
     print(f"Best model will be saved by: {args.save_best_by}")
+    if args.train_task == "atadd-track2":
+        print(
+            "Track2 crop setting: "
+            f"train_crop_mode={getattr(args, 'train_crop_mode', 'head')}, "
+            f"dev_crop_mode={getattr(args, 'dev_crop_mode', 'head')}, "
+            f"train_num_crops={getattr(args, 'train_num_crops', 1)}, "
+            f"crop_consistency_weight={getattr(args, 'crop_consistency_weight', 0.0)}"
+        )
 
     if args.base_loss == "ce":
         criterion = nn.CrossEntropyLoss(weight=weight)
@@ -451,6 +685,10 @@ def train(args):
     prev_loss = float("inf")
     prev_eer = float("inf")
     prev_f1 = -float("inf")
+    prev_weak3_f1 = -float("inf")
+    prev_min4_f1 = -float("inf")
+    prev_all95_f1 = -float("inf")
+    prev_safe_f1 = -float("inf")
     monitor_loss = 'base_loss'
 
     for epoch_num in tqdm(range(args.num_epochs)):
@@ -503,17 +741,23 @@ def train(args):
             else:
                 feat_optimizer.zero_grad()
 
-                feats, feat_outputs = feat_model(feat)
+                feats, feat_outputs, crop_cons_loss = forward_maybe_multicrop(
+                    args,
+                    feat_model,
+                    feat
+                )
 
                 # Detection loss
                 if args.train_task == "atadd-track2" and args.t2_gdro and type_ids is not None:
+                    active_types = [0, 1, 3] if getattr(args, "t2_gdro_weak3", False) else None
                     feat_loss = type_group_dro_ce_loss(
                         outputs=feat_outputs,
                         labels=labels,
                         type_ids=type_ids,
                         class_weight=weight,
                         eta=args.t2_gdro_eta,
-                        n_types=4
+                        n_types=4,
+                        active_types=active_types
                     )
                 else:
                     feat_loss = criterion(feat_outputs, labels)
@@ -588,6 +832,33 @@ def train(args):
 
                     feat_loss = feat_loss - args.ufm_router_entropy * ent
                     
+                # ======================================================
+                # Singing teacher anchor: protect baseline Singing capability
+                # ======================================================
+                if (
+                    singing_teacher is not None
+                    and getattr(args, "t2_sing_anchor_weight", 0.0) > 0
+                    and type_ids is not None
+                ):
+                    with torch.no_grad():
+                        _, teacher_outputs = singing_teacher(feat if feat.dim() != 3 else feat[:, 0, :])
+
+                    # If using multi-crop, anchor the mean student logits to teacher on first crop.
+                    loss_sing_anchor = singing_teacher_anchor_loss(
+                        student_logits=feat_outputs,
+                        teacher_logits=teacher_outputs,
+                        labels=labels,
+                        type_ids=type_ids,
+                        temp=getattr(args, "t2_sing_anchor_temp", 2.0),
+                        margin_weight=getattr(args, "t2_sing_anchor_margin_weight", 0.2),
+                        correct_only=getattr(args, "t2_sing_anchor_correct_only", False)
+                    )
+                    feat_loss = feat_loss + args.t2_sing_anchor_weight * loss_sing_anchor
+
+                # Multi-crop consistency regularization
+                if getattr(args, "crop_consistency_weight", 0.0) > 0:
+                    feat_loss = feat_loss + args.crop_consistency_weight * crop_cons_loss
+
                 if not torch.isfinite(feat_loss):
                     print(
                         f"[skip non-finite loss] epoch={epoch_num}, step={i}, "
@@ -706,6 +977,7 @@ def train(args):
             # val_f1 = f1_score(labels, preds, average='macro')
             
             ### 5,13
+            type_f1s = None
             if args.train_task == "atadd-track2" and len(type_loader) > 0:
                 type_ids_np = torch.cat(type_loader, 0).data.cpu().numpy()
                 val_f1, type_f1s = track2_macro_f1_by_type(
@@ -717,6 +989,20 @@ def train(args):
                 print("Track2 Type F1s [speech, sound, singing, music]:", type_f1s)
             else:
                 val_f1 = f1_score(labels, preds, average='macro', zero_division=0)
+
+            val_weak3_f1, val_min4_f1, val_all95_f1, t2_safe_f1 = compute_floor_scores(
+                type_f1s=type_f1s,
+                avg_f1=val_f1,
+                floor=getattr(args, "t2_target_floor", 0.95),
+                penalty=getattr(args, "t2_floor_penalty", 2.0),
+                singing_floor=getattr(args, "t2_singing_floor", 0.94),
+                singing_penalty=getattr(args, "t2_singing_penalty", 1.5)
+            )
+
+            print("Val Weak3F1 [speech/sound/music]: {}".format(val_weak3_f1))
+            print("Val Min4F1: {}".format(val_min4_f1))
+            print("Val All95F1 score: {}".format(val_all95_f1))
+            print("Val SafeF1: {}".format(t2_safe_f1))
             ### 5,13
             
             with open(os.path.join(args.out_fold, "dev_loss.log"), "a") as log:
@@ -724,7 +1010,11 @@ def train(args):
                     str(epoch_num) + "\t" +
                     str(valLoss) + "\t" +
                     str(val_eer) + "\t" +
-                    str(val_f1) + "\n"
+                    str(val_f1) + "\t" +
+                    str(val_weak3_f1) + "\t" +
+                    str(val_min4_f1) + "\t" +
+                    str(val_all95_f1) + "\t" +
+                    str(t2_safe_f1) + "\n"
                 )
 
             print("Val Loss: {}".format(valLoss))
@@ -752,6 +1042,26 @@ def train(args):
         elif args.save_best_by == "f1":
             if val_f1 > prev_f1:
                 prev_f1 = val_f1
+                save_flag = True
+
+        elif args.save_best_by == "weak3_f1":
+            if val_weak3_f1 > prev_weak3_f1:
+                prev_weak3_f1 = val_weak3_f1
+                save_flag = True
+
+        elif args.save_best_by == "min4_f1":
+            if val_min4_f1 > prev_min4_f1:
+                prev_min4_f1 = val_min4_f1
+                save_flag = True
+
+        elif args.save_best_by == "all95_f1":
+            if val_all95_f1 > prev_all95_f1:
+                prev_all95_f1 = val_all95_f1
+                save_flag = True
+
+        elif args.save_best_by == "safe_f1":
+            if t2_safe_f1 > prev_safe_f1:
+                prev_safe_f1 = t2_safe_f1
                 save_flag = True
 
         if save_flag:

@@ -21,86 +21,19 @@ def torchaudio_load(filepath):
     return [waveform, sr]
 
 
+def pad_dataset(wav, audio_length=64600):
+    waveform = wav.squeeze(0)
+    waveform_len = waveform.shape[0]
+    cut = audio_length
 
-def _to_1d_tensor(wav):
-    """
-    Convert librosa / numpy / torch waveform to a contiguous 1-D float tensor.
-    Compatible with:
-      - torch Tensor [1, L] or [L]
-      - numpy array [L]
-    """
-    if isinstance(wav, torch.Tensor):
-        x = wav.detach().clone().float()
+    if waveform_len >= cut:
+        waveform = waveform[:cut]
     else:
-        x = torch.tensor(np.asarray(wav), dtype=torch.float32)
+        num_repeats = int(cut / waveform_len) + 1
+        waveform = torch.tile(waveform, (1, num_repeats))[:, :cut][0]
 
-    x = x.squeeze()
-    if x.dim() == 0:
-        x = x.view(1)
-    return x.contiguous()
-
-
-def pad_dataset(wav, audio_length=64600, crop_mode="head"):
-    """
-    Return one waveform crop with shape [audio_length].
-
-    crop_mode:
-      head   : old behavior, take the beginning
-      center : take center crop
-      random : random crop for training
-    """
-    waveform = _to_1d_tensor(wav)
-    L = waveform.numel()
-    cut = int(audio_length)
-
-    if L <= 0:
-        waveform = torch.zeros(cut, dtype=torch.float32)
-
-    elif L >= cut:
-        if crop_mode == "head":
-            start = 0
-        elif crop_mode == "center":
-            start = max((L - cut) // 2, 0)
-        elif crop_mode == "random":
-            start = random.randint(0, max(L - cut, 0))
-        else:
-            raise ValueError(f"Unknown crop_mode: {crop_mode}")
-
-        waveform = waveform[start:start + cut]
-
-    else:
-        num_repeats = int(np.ceil(cut / max(L, 1))) + 1
-        waveform = waveform.repeat(num_repeats)[:cut]
-
-    waveform = waveform - waveform.mean()
-    waveform = waveform / torch.sqrt(waveform.var(unbiased=False) + 1e-7)
-    return waveform.contiguous()
-
-
-def make_multi_crops(wav, audio_length=64600, num_crops=1, crop_mode="random"):
-    """
-    Return:
-      num_crops <= 1: [L]
-      num_crops > 1 : [K, L]
-    """
-    num_crops = max(1, int(num_crops))
-
-    if num_crops <= 1:
-        return pad_dataset(
-            wav,
-            audio_length=audio_length,
-            crop_mode=crop_mode
-        )
-
-    crops = [
-        pad_dataset(
-            wav,
-            audio_length=audio_length,
-            crop_mode=crop_mode
-        )
-        for _ in range(num_crops)
-    ]
-    return torch.stack(crops, dim=0).contiguous()
+    waveform = (waveform - waveform.mean()) / torch.sqrt(waveform.var() + 1e-7)
+    return waveform
 
 ####5.13 修改 T2-GDRO-ADV + T2-Router-XLSR-MERT
 TYPE2ID = {
@@ -203,9 +136,7 @@ class atadd_dataset(Dataset):
         rawboost=False,
         musanrir=False,
         audio_length=64600,
-        return_type=False,
-        crop_mode="head",
-        num_crops=1
+        return_type=False
     ):
         super(atadd_dataset, self).__init__()
 
@@ -216,8 +147,6 @@ class atadd_dataset(Dataset):
         self.rawboost = rawboost
         self.musanrir = musanrir
         self.return_type = return_type
-        self.crop_mode = crop_mode
-        self.num_crops = max(1, int(num_crops))
 
         self.AudioAugmentor = AudioAugmentor()
 
@@ -258,22 +187,11 @@ class atadd_dataset(Dataset):
             waveform = waveform.squeeze(dim=0).detach().cpu().numpy()
             waveform = process_Rawboost_feature(waveform, sr=sr)
 
-        waveform = make_multi_crops(
-            waveform,
-            audio_length=self.audio_length,
-            num_crops=self.num_crops,
-            crop_mode=self.crop_mode
-        )
+        waveform = pad_dataset(waveform, self.audio_length)
 
         if self.musanrir:
-            if waveform.dim() == 2:
-                waveform = torch.stack(
-                    [self._apply_augmentation(w, w.size(0)) for w in waveform],
-                    dim=0
-                )
-            else:
-                audio_length = waveform.size(0)
-                waveform = self._apply_augmentation(waveform, audio_length)
+            audio_length = waveform.size(0)
+            waveform = self._apply_augmentation(waveform, audio_length)
 
         label = self.label[label]
 

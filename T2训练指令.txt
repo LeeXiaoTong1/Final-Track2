@@ -129,3 +129,152 @@ python generate_score_multicrop.py \
   --num_workers 8 \
   --agg mean_logit \
   --score_file ./ckpt_t2/ufm_stage3_final_mert_obeats_ft/result/dev_multicrop3_meanlogit.csv
+  
+  
+  
+  
+  
+  
+  
+  
+！！！！！！！！！！！！！！！！！！！！  
+5.25日的，推荐训练方式：从旧的 epoch1 checkpoint 继续
+
+你之前 ufm_layers=1 的 epoch1 checkpoint 已经有不错的 Dev F1，所以不要浪费它。补丁后，旧 checkpoint 里的 MHA 参数会作为 unexpected keys 被忽略；其他专家、router、memory、decoder 参数仍然能加载。
+
+先跑一个 stable-cross warmup：
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+python main_train.py \
+  --gpu 0 \
+  --train_task atadd-track2 \
+  --model ufm-track2-full \
+  --init_from ./ckpt_t2/ufm2s_stage1_type_randomcrop_fast/atadd_model.pt \
+  --xlsr /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/wav2vec2-xls-r-300m \
+  --mert /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/MERT-v1-330M \
+  --beats /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/OpenBEATs-ICME \
+  --ufm_freeze_xlsr \
+  --ufm_freeze_mert \
+  --ufm_freeze_beats \
+  --ufm_dim 512 \
+  --ufm_mem_slots 16 \
+  --ufm_heads 8 \
+  --ufm_layers 1 \
+  --ufm_dropout 0.0 \
+  --t2_return_type \
+  --ufm_type_loss 0.005 \
+  --ufm_router_entropy 0.0 \
+  --train_crop_mode random \
+  --dev_crop_mode head \
+  --train_num_crops 1 \
+  --crop_consistency_weight 0.0 \
+  --seed 1234 \
+  --batch_size 8 \
+  --lr 0.0000001 \
+  --num_epochs 3 \
+  --interval 3 \
+  --save_best_by f1 \
+  --out_fold ./ckpt_t2/ufm_stage1b_stable_cross_layers1
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+python main_train.py \
+  --gpu 0 \
+  --train_task atadd-track2 \
+  --model ufm-track2-full \
+  --xlsr /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/wav2vec2-xls-r-300m \
+  --mert /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/MERT-v1-330M \
+  --beats /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/OpenBEATs-ICME \
+  --ufm_freeze_xlsr \
+  --ufm_freeze_mert \
+  --ufm_freeze_beats \
+  --ufm_dim 512 \
+  --ufm_mem_slots 16 \
+  --ufm_heads 8 \
+  --ufm_layers 1 \
+  --ufm_dropout 0.0 \
+  --t2_return_type \
+  --t2_gdro \
+  --t2_gdro_weak3 \
+  --t2_gdro_eta 0.15 \
+  --ufm_type_loss 0.003 \
+  --ufm_router_entropy 0.0 \
+  --t2_teacher_model ft-w2v2aasist \
+  --t2_sing_teacher_ckpt /root/autodl-tmp/AT-ADD-Baseline-track2/ckpt_t2/gdro_adv_xlsr_aasist/checkpoint/atadd_model_10.pt \
+  --t2_sing_anchor_weight 0.5 \
+  --t2_sing_anchor_temp 2.0 \
+  --t2_sing_anchor_margin_weight 0.2 \
+  --t2_sing_anchor_correct_only \
+  --train_crop_mode random \
+  --dev_crop_mode head \
+  --train_num_crops 1 \
+  --crop_consistency_weight 0.0 \
+  --t2_target_floor 0.95 \
+  --t2_floor_penalty 2.0 \
+  --seed 1234 \
+  --batch_size 32 \
+  --lr 0.000001 \
+  --num_epochs 5 \
+  --interval 4 \
+  --save_best_by all95_f1 \
+  --out_fold ./ckpt_t2/ufm_all95_stage1_teacher_weak3
+  
+  
+  export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+python main_train.py \
+  --gpu 0 \
+  --train_task atadd-track2 \
+  --model ufm-track2-full \
+  --init_from ./ckpt_t2/ufm_all95_stage1_teacher_weak3/atadd_model.pt \
+  --xlsr /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/wav2vec2-xls-r-300m \
+  --mert /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/MERT-v1-330M \
+  --beats /root/autodl-tmp/AT-ADD-Baseline-track2-R2/huggingface/OpenBEATs-ICME \
+  --ufm_freeze_xlsr \
+  --ufm_freeze_mert \
+  --ufm_freeze_beats \
+  --ufm_dim 512 \
+  --ufm_mem_slots 16 \
+  --ufm_heads 8 \
+  --ufm_layers 1 \
+  --ufm_dropout 0.0 \
+  --t2_return_type \
+  --t2_gdro \
+  --t2_gdro_weak3 \
+  --t2_gdro_eta 0.10 \
+  --ufm_type_loss 0.001 \
+  --ufm_router_entropy 0.0 \
+  --t2_teacher_model ft-w2v2aasist \
+  --t2_sing_teacher_ckpt /root/autodl-tmp/AT-ADD-Baseline-track2/ckpt_t2/gdro_adv_xlsr_aasist/checkpoint/atadd_model_10.pt \
+  --t2_sing_anchor_weight 0.5 \
+  --t2_sing_anchor_temp 2.0 \
+  --t2_sing_anchor_margin_weight 0.2 \
+  --t2_sing_anchor_correct_only \
+  --train_crop_mode random \
+  --dev_crop_mode head \
+  --train_num_crops 1 \
+  --crop_consistency_weight 0.0 \
+  --t2_target_floor 0.95 \
+  --t2_floor_penalty 2.0 \
+  --seed 1234 \
+  --batch_size 32 \
+  --lr 0.0000002 \
+  --num_epochs 3 \
+  --interval 3 \
+  --save_best_by all95_f1 \
+  --out_fold ./ckpt_t2/ufm_all95_stage2_teacher_weak3
