@@ -1,0 +1,230 @@
+# AT-ADD 2026 Metadata - Track 2
+# File name suggestion: zsx1111_track2_90.77.yaml
+# NOTE: Please edit the TODO_* author fields before sending to the organizers.
+
+submission:
+  team_name: zsx1111
+  track: Track2
+  codabench_username: zsx1111
+
+authors:
+  # Please replace TODO_* fields with your official author information.
+  - lastname: TODO_LASTNAME
+    firstname: TODO_FIRSTNAME
+    email: TODO_EMAIL
+    corresponding: true
+    affiliation:
+      organization: TODO_ORGANIZATION
+      department: TODO_DEPARTMENT
+      location: TODO_CITY_COUNTRY
+
+countermeasure:
+  name: UFM_Robust_Three_Branch_Fusion
+  description: >
+    Our Track 2 countermeasure is a type-aware three-branch ensemble for
+    four-type audio deepfake detection. The final system does not use the
+    later type-filtered specialists, because they showed weaker full-evaluation
+    generalization in our ablation. The system combines a stable
+    FT-XLSR-AASIST baseline branch, a UFM multi-expert branch optimized for
+    robust sound/music handling while preserving vocal categories, and a
+    all-type UFM music-focused branch. An independent four-way audio-type classifier
+    predicts speech/sound/singing/music probabilities. The final decision is
+    produced by a dev-set-tuned type-aware fusion rule with a held-out split,
+    using only official AT-ADD Track 2 train/dev data for training and
+    calibration. The evaluation set is used only for inference.
+
+  total_subsystems: 4
+
+  subsystems:
+    - name: FT-XLSR-AASIST baseline branch
+      description: >
+        A wav2vec2-XLS-R-300M frontend followed by an AASIST backend. This
+        branch is used as a stable vocal baseline, especially for singing, and
+        also serves as a teacher checkpoint for UFM teacher-anchor training.
+        The checkpoint used in the final system is the internally selected
+        gdro_adv_xlsr_aasist checkpoint: checkpoint/atadd_model_10.pt.
+      data_used_train:
+        - AT-ADD Track2 official train set
+      data_used_dev:
+        - AT-ADD Track2 official dev set
+      data_augmentation:
+        - random crop during training
+      model_frontend:
+        - wav2vec2-XLS-R-300M
+      model_backbone:
+        - AASIST
+      training_loss:
+        - weighted cross-entropy
+        - type-aware GroupDRO variant during baseline development
+      training_strategy:
+        - full fine-tuning
+        - dev-set checkpoint selection
+      pretrained_model_urls:
+        - https://huggingface.co/facebook/wav2vec2-xls-r-300m
+
+    - name: UFM vocal-anchor sound/music branch
+      description: >
+        A UFMTrack2Full multi-expert detector with frozen XLS-R, MERT, and
+        OpenBEATs frontends. The fusion module includes projected SSL features,
+        a complex artifact encoder, type-conditioned forgery memory, uncertainty
+        expert routing, a stable gated semantic-forensic cross-stream block,
+        and a query decoder for real/fake logits. The branch is initialized
+        from the all95 UFM checkpoint and fine-tuned with Sound/Music-focused
+        GroupDRO while using the FT-XLSR-AASIST checkpoint as a vocal teacher
+        anchor. This branch is used as the general UFM detector in the final
+        fusion.
+      data_used_train:
+        - AT-ADD Track2 official train set
+      data_used_dev:
+        - AT-ADD Track2 official dev set
+      data_augmentation:
+        - random crop during training
+      model_frontend:
+        - wav2vec2-XLS-R-300M
+        - MERT-v1-330M
+        - OpenBEATs-ICME
+        - complex spectral artifact encoder
+      model_backbone:
+        - UFMTrack2Full fusion head
+        - type-conditioned forgery memory
+        - uncertainty expert router
+        - stable gated cross-stream fusion
+        - forgery query decoder
+      training_loss:
+        - weighted cross-entropy
+        - type-aware GroupDRO focused on sound/music
+        - teacher-anchor distillation for vocal preservation
+        - auxiliary type loss
+      training_strategy:
+        - frozen SSL frontends
+        - trainable fusion/router/memory/decoder modules
+        - dev-set checkpoint selection using all95/specialist criteria
+      pretrained_model_urls:
+        - https://huggingface.co/facebook/wav2vec2-xls-r-300m
+        - https://huggingface.co/m-a-p/MERT-v1-330M
+        - https://huggingface.co/shikhar7ssu/OpenBEATs-ICME
+
+    - name: all-type UFM music-focused branch
+      description: >
+        A second UFMTrack2Full detector fine-tuned to improve the Music type.
+        It shares the same frozen SSL frontends and UFM architecture as the
+        general UFM branch, but is trained with Music-focused GroupDRO and a
+        vocal teacher-anchor regularizer to reduce degradation on singing-like
+        samples. This branch supplies a music-specialized real/fake score to
+        the final fusion.
+      data_used_train:
+        - AT-ADD Track2 official train set
+      data_used_dev:
+        - AT-ADD Track2 official dev set
+      data_augmentation:
+        - random crop during training
+      model_frontend:
+        - wav2vec2-XLS-R-300M
+        - MERT-v1-330M
+        - OpenBEATs-ICME
+        - complex spectral artifact encoder
+      model_backbone:
+        - UFMTrack2Full fusion head
+        - type-conditioned forgery memory
+        - uncertainty expert router
+        - stable gated cross-stream fusion
+        - forgery query decoder
+      training_loss:
+        - weighted cross-entropy
+        - Music-focused type-aware GroupDRO
+        - teacher-anchor distillation for singing preservation
+      training_strategy:
+        - frozen SSL frontends
+        - initialized from a previous UFM checkpoint
+        - trainable fusion/router/memory/decoder modules
+      pretrained_model_urls:
+        - https://huggingface.co/facebook/wav2vec2-xls-r-300m
+        - https://huggingface.co/m-a-p/MERT-v1-330M
+        - https://huggingface.co/shikhar7ssu/OpenBEATs-ICME
+
+    - name: Independent audio-type classifier
+      description: >
+        A separate four-way classifier trained to predict the Track 2 audio
+        type: speech, sound, singing, or music. It uses frozen SSL audio
+        representations and a lightweight classifier head. Its output is not
+        used as a real/fake score; it provides routing probabilities for the
+        type-aware fusion rule.
+      data_used_train:
+        - AT-ADD Track2 official train set
+      data_used_dev:
+        - AT-ADD Track2 official dev set
+      data_augmentation:
+        - random crop during training
+      model_frontend:
+        - wav2vec2-XLS-R-300M
+        - MERT-v1-330M
+        - OpenBEATs-ICME
+      model_backbone:
+        - pooled SSL feature fusion
+        - lightweight MLP classifier
+      training_loss:
+        - cross-entropy for four-way type classification
+      training_strategy:
+        - frozen SSL frontends
+        - type-balanced training/checkpoint selection on dev
+      pretrained_model_urls:
+        - https://huggingface.co/facebook/wav2vec2-xls-r-300m
+        - https://huggingface.co/m-a-p/MERT-v1-330M
+        - https://huggingface.co/shikhar7ssu/OpenBEATs-ICME
+
+  combination:
+    used: Yes
+    strategy: >
+      Type-aware three-branch score fusion. For each audio file, each detector
+      branch outputs a real score from 5-crop mean-logit inference. The type
+      classifier outputs q_speech, q_sound, q_singing, and q_music. We sharpen
+      type probabilities by q=normalize(q^temp). For each type, a dev-tuned
+      branch-weight vector combines baseline, general UFM, and music-specialist
+      scores. The final score and type-specific threshold are both obtained by
+      the weighted sum over predicted type probabilities. Fusion parameters are
+      tuned only on the official dev set with a hash-based held-out split.
+    involved_subsystems:
+      - FT-XLSR-AASIST baseline branch
+      - UFM vocal-anchor sound/music branch
+      - all-type UFM music-focused branch
+      - Independent audio-type classifier
+
+  decision_rule:
+    description: >
+      Each detection branch uses 5 evenly spaced crops and mean-logit aggregation
+      to produce a real probability. The final score is computed as:
+      q=normalize(type_prob^temp);
+      score=sum_t q_t * (W_t dot [score_baseline, score_ufm, score_music]);
+      threshold=sum_t q_t * theta_t + offset. The final prediction is real if
+      score >= threshold, otherwise fake. The parameters W, theta, temp, and
+      offset are selected using only the official dev set; no progress or eval
+      labels are used for training or threshold tuning.
+
+results:
+  t2_progress_macro_f1: 91.18
+  t2_progress_speech: 82.03
+  t2_progress_sound: 92.97
+  t2_progress_singing: 96.38
+  t2_progress_music: 93.36
+
+  t2_eval_macro_f1: 90.77
+  t2_eval_speech: 81.88
+  t2_eval_sound: 92.55
+  t2_eval_singing: 95.47
+  t2_eval_music: 93.15
+
+compliance:
+  only_official_train_dev_used: true
+  no_external_audio_data: true
+  no_progress_or_eval_training: true
+  no_progress_or_eval_threshold_tuning: true
+  no_self_generated_external_synthetic_data: true
+  total_subsystems_no_more_than_five: true
+
+  statement: >
+    We confirm that our submitted system follows the AT-ADD 2026 challenge rules.
+    All detector branches, the type classifier, checkpoint selection, and fusion
+    parameters were trained or selected using only the official AT-ADD Track 2
+    train/dev data. The progress and evaluation sets were used only for inference
+    and leaderboard submission, not for model training, self-training, or
+    threshold tuning.
