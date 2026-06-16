@@ -15,7 +15,11 @@ class EvalAudio(Dataset):
     def __len__(self): return len(self.files)
     def __getitem__(self, idx):
         name=self.files[idx]
+<<<<<<< HEAD
+        wav,_=librosa.load(str(self.audio_dir/name), sr=1600, mono=True)
+=======
         wav,_=librosa.load(str(self.audio_dir/name), sr=16000, mono=True)
+>>>>>>> update project
         wav=crop_or_repeat(wav,self.audio_len,"head")
         return torch.from_numpy(wav).float(), name
 
